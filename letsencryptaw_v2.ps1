@@ -31,92 +31,95 @@ Param(
     [string]$storageName,
     [string]$AGResourceGroupName,
     [string]$AGName,
-    [string]$AGOldCertName
+    [string]$AGOldCertName,
+    [string]$containerName
 )
 
-# Ensures that no login info is saved after the runbook is done
-Disable-AzContextAutosave
+Import-Module ACME-PS
 
-# Log in as the service principal from the Runbook
-$connection = Get-AutomationConnection -Name AzureRunAsConnection
-Login-AzAccount -ServicePrincipal -Tenant $connection.TenantID -ApplicationId $connection.ApplicationID -CertificateThumbprint $connection.CertificateThumbprint
+try {
+    Write-Output "Logging in as azure managed identity"
+    Disable-AzContextAutosave # Ensures that no login info is saved after the runbook is done
+    $azureContext = (Connect-AzAccount -Identity).context
+    $azureContext = Set-AzContext -SubscriptionName $azureContext.Subscription -DefaultProfile $azureContext
+    Write-Output "Logged in as " + $azureContext
+    Write-Output "========================="
 
-# Create a state object and save it to the harddrive
-$state = New-ACMEState -Path $env:TEMP
-$serviceName = 'LetsEncrypt'
+    Write-Output "Registering with ACME service"
+    $state = New-ACMEState -Path $env:TEMP
+    $serviceName = 'LetsEncrypt'
+    Get-ACMEServiceDirectory $state -ServiceName $serviceName -PassThru;
+    New-ACMENonce $state;
+    New-ACMEAccountKey $state -PassThru;
+    New-ACMEAccount $state -EmailAddresses $EmailAddress -AcceptTOS; # Register the account key with the acme service. The account key will automatically be read from the state
+    Write-Output "========================="
 
-# Fetch the service directory and save it in the state
-Get-ACMEServiceDirectory $state -ServiceName $serviceName -PassThru;
+    Write-Output "Creating ACME Challenge"
+    $state = Get-ACMEState -Path $env:TEMP;
+    New-ACMENonce $state -PassThru; 
+    $identifier = New-ACMEIdentifier $domain;
+    $order = New-ACMEOrder $state -Identifiers $identifier;
+    $authZ = Get-ACMEAuthorization -State $state -Order $order;
+    $challenge = Get-ACMEChallenge $state $authZ "http-01";
+    Write-Output "Challenge data is " + $challenge.Data;
+    Write-Output "========================="
 
-# Get the first anti-replay nonce
-New-ACMENonce $state;
+    Write-Output "Creating file requested by ACME Challenge"
+    $fileName = $env:TMP + '\' + $challenge.Token;
+    Write-Output "File name is " + $fileName;
+    Set-Content -Path $fileName -Value $challenge.Data.Content -NoNewline;
+    $blobName = ".well-known/acme-challenge/" + $challenge.Token
+    $storageContext = New-AzStorageContext -StorageAccountName $storageName
+    Set-AzStorageBlobContent -File $fileName -Container $containerName -Context $storageContext -Blob $blobName -Properties @{"ContentType" = "text/plain"}
+    Write-Output "========================="
 
-# Create an account key. The state will make sure it's stored.
-New-ACMEAccountKey $state -PassThru;
+    Write-Output "Notifying ACME service that challenge file is ready"
+    $challenge | Complete-ACMEChallenge $state;
+    Write-Output "========================="
 
-# Register the account key with the acme service. The account key will automatically be read from the state
-New-ACMEAccount $state -EmailAddresses $EmailAddress -AcceptTOS;
+    Write-Output "Waiting for ACME order"
+    while($order.Status -notin ("ready","invalid")) {
+        Start-Sleep -Seconds 10;
+        $order | Update-ACMEOrder $state -PassThru;
+        Write-Output "Continuing to poll for ACME order"
+    }
+    Write-Output "========================="
+# Check for invalid order status and get authorization error details
+    if($order.Status -ieq "invalid") {  
+        Write-Output "Showing details of invalid order"
+        $order | Get-ACMEAuthorizationError -State $state;
+        throw "Order was invalid";
+    }
+    Write-Output "Issuing certificate signing request"
+    $certKey = New-ACMECertificateKey -Path "$env:TEMP\$domain.key.xml";
+    Complete-ACMEOrder $state -Order $order -CertificateKey $certKey;
+    Write-Output "========================="
 
-# Load an state object to have service directory and account keys available
-$state = Get-ACMEState -Path $env:TEMP;
+    Write-Output "Waiting for certificate"
+    while(-not $order.CertificateUrl) {
+        Start-Sleep -Seconds 15
+        $order | Update-ACMEOrder $state -PassThru
+        Write-Output "Continuing to poll for certificate"
+    }
+    $password = ConvertTo-SecureString -String "Passw@rd123***" -Force -AsPlainText
+    Export-ACMECertificate $state -Order $order -CertificateKey $certKey -Path "$env:TEMP\$domain.pfx" -Password $password;
+    Write-Output "========================="
 
-# It might be neccessary to acquire a new nonce, so we'll just do it for the sake of the example.
-New-ACMENonce $state -PassThru;
+    Write-Output "Cleaning up storage"
+    Remove-AzStorageBlob -Container $containerName -Context $storageContext -Blob $blobName
+    Write-Output "========================="
 
-# Create the identifier for the DNS name
-$identifier = New-ACMEIdentifier $domain;
+    Write-Output "Renewing application gateway certificate with new certificate"
+    $appgw = Get-AzApplicationGateway -ResourceGroupName $AGResourceGroupName -Name $AGName
+    Set-AzApplicationGatewaySSLCertificate -Name $AGOldCertName -ApplicationGateway $appgw -CertificateFile "$env:TEMP\$domain.pfx" -Password $password
+    Set-AzApplicationGateway -ApplicationGateway $appgw
+    Write-Output "========================="
 
-# Create the order object at the ACME service.
-$order = New-ACMEOrder $state -Identifiers $identifier;
-
-# Fetch the authorizations for that order
-$authZ = Get-ACMEAuthorization -State $state -Order $order;
-
-# Select a challenge to fullfill
-$challenge = Get-ACMEChallenge $state $authZ "http-01";
-
-# Inspect the challenge data
-$challenge.Data;
-
-# Create the file requested by the challenge
-$fileName = $env:TMP + '\' + $challenge.Token;
-Set-Content -Path $fileName -Value $challenge.Data.Content -NoNewline;
-
-$blobName = ".well-known/acme-challenge/" + $challenge.Token
-$storageAccount = Get-AzStorageAccount -ResourceGroupName $STResourceGroupName -Name $storageName
-$ctx = $storageAccount.Context
-Set-AzStorageBlobContent -File $fileName -Container "public" -Context $ctx -Blob $blobName
-
-# Signal the ACME server that the challenge is ready
-$challenge | Complete-ACMEChallenge $state;
-
-# Wait a little bit and update the order, until we see the states
-while($order.Status -notin ("ready","invalid")) {
-    Start-Sleep -Seconds 10;
-    $order | Update-ACMEOrder $state -PassThru;
+    Write-Output "Finished renewing certificate"
 }
+catch 
+{
+    Write-Error $_
+    throw "Failed to renew certificate"
 
-# We should have a valid order now and should be able to complete it
-# Therefore we need a certificate key
-$certKey = New-ACMECertificateKey -Path "$env:TEMP\$domain.key.xml";
-
-# Complete the order - this will issue a certificate singing request
-Complete-ACMEOrder $state -Order $order -CertificateKey $certKey;
-
-# Now we wait until the ACME service provides the certificate url
-while(-not $order.CertificateUrl) {
-    Start-Sleep -Seconds 15
-    $order | Update-Order $state -PassThru
 }
-
-# As soon as the url shows up we can create the PFX
-$password = ConvertTo-SecureString -String "Passw@rd123***" -Force -AsPlainText
-Export-ACMECertificate $state -Order $order -CertificateKey $certKey -Path "$env:TEMP\$domain.pfx" -Password $password;
-
-# Delete blob to check DNS
-Remove-AzStorageBlob -Container "public" -Context $ctx -Blob $blobName
-
-### RENEW APPLICATION GATEWAY CERTIFICATE ###
-$appgw = Get-AzApplicationGateway -ResourceGroupName $AGResourceGroupName -Name $AGName
-Set-AzApplicationGatewaySSLCertificate -Name $AGOldCertName -ApplicationGateway $appgw -CertificateFile "$env:TEMP\$domain.pfx" -Password $password
-Set-AzApplicationGateway -ApplicationGateway $appgw
